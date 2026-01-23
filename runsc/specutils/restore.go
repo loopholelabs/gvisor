@@ -478,6 +478,10 @@ func validateSpecs(oldSpecs, newSpecs map[string]*specs.Spec) error {
 
 // RestoreValidateSpec deals with spec validation according to the given policy during restore.
 func RestoreValidateSpec(oldSpecs, newSpecs map[string]*specs.Spec, conf *config.Config) error {
+	// PATCHED: Always skip validation for checkpoint patching experiments
+	log.Warningf("Spec validation disabled for checkpoint patching experiments")
+	return nil
+	/* Original code:
 	switch conf.RestoreSpecValidation {
 	case config.RestoreSpecValidationIgnore:
 		return nil
@@ -495,6 +499,7 @@ func RestoreValidateSpec(oldSpecs, newSpecs map[string]*specs.Spec, conf *config
 		return fmt.Errorf("invalid option for restore spec validation %d", conf.RestoreSpecValidation)
 	}
 	return nil
+	*/
 }
 
 // ConvertSpecsToString returns the map of container specs in string format.

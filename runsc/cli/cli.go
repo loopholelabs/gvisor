@@ -160,7 +160,8 @@ func Run(forEachCmd func(cb func(cmd subcommands.Command, group string), help *H
 	} else {
 		// Stderr is reserved for the application, just discard the logs if no debug
 		// log is specified.
-		emitters = append(emitters, newEmitter("text", io.Discard))
+		// PATCHED: Force logging to stderr to diagnose init container issues
+		emitters = append(emitters, newEmitter("text", os.Stderr))
 	}
 
 	if *panicLogFD > -1 || *debugLogFD > -1 {

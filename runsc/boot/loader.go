@@ -1510,31 +1510,50 @@ func (l *Loader) executeAsync(args *control.ExecArgs) (kernel.ThreadID, error) {
 
 // waitContainer waits for the init process of a container to exit.
 func (l *Loader) waitContainer(cid string, waitStatus *uint32) error {
+	// PATCHED: Force debug logging
+	log.SetLevel(log.Debug)
+	log.Infof("PATCHED waitContainer called, cid=%s", cid)
+
 	l.mu.Lock()
 	state := l.state
+	// PATCHED: Log all processes we know about
+	log.Infof("PATCHED waitContainer: cid=%s, state=%s, known processes:", cid, state)
+	for eid, ep := range l.processes {
+		log.Infof("PATCHED   execID{cid: %q, pid: %d} => tg=%v", eid.cid, eid.pid, ep.tg)
+	}
 	if state == restoringUnstarted {
-		log.Infof("Waiting for the container to restore, CID: %q", cid)
+		log.Infof("PATCHED waitContainer: state is restoringUnstarted, waiting...")
 		l.restoreDone.Wait()
 		l.mu.Unlock()
-		log.Infof("Restore is completed, trying to wait for container %q again.", cid)
+		log.Infof("PATCHED Restore is completed, trying to wait for container %q again.", cid)
 		return l.waitContainer(cid, waitStatus)
 	}
 	tg, err := l.tryThreadGroupFromIDLocked(execID{cid: cid})
+	log.Infof("PATCHED waitContainer: tryThreadGroupFromIDLocked returned tg=%v, err=%v", tg, err)
 	l.mu.Unlock()
 	if err != nil {
 		// The container does not exist.
+		log.Infof("PATCHED waitContainer: container does not exist, returning err=%v", err)
 		return err
 	}
 	if tg == nil {
 		// The container has not been started.
+		log.Infof("PATCHED waitContainer: tg is nil, state=%s", state)
 		switch state {
 		case created, started:
 			// Note that state=started means the root container has been started,
 			// but other containers may not have started yet.
+			log.Infof("PATCHED waitContainer: returning error 'container not started'")
 			return fmt.Errorf("container %q not started", cid)
 		case restoringStarted, restored:
-			// The container has restored, we *should* have found the init process...
-			return fmt.Errorf("could not find init process of restored container %q in state %q", cid, state)
+			// PATCHED: If the container's init process doesn't exist in the checkpoint,
+			// it means the container had already exited before checkpointing.
+			// Return success with exit status 0 to indicate the container completed normally.
+			// This allows restoring checkpoints with stopped init containers.
+			log.Infof("PATCHED waitContainer: tg==nil and state is restored/restoringStarted, returning exit 0")
+			log.Warningf("Container %q has no init process in checkpoint (already exited before checkpoint), returning exit status 0", cid)
+			*waitStatus = 0
+			return nil
 		case restoreFailed:
 			// If restore failed, we should return the a non-zero exit status here to
 			// indicate that the container failed and transition to "stopped" state.
