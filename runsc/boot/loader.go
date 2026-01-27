@@ -2174,3 +2174,43 @@ func (l *Loader) GetContainerSpecs() map[string]*specs.Spec {
 	defer l.mu.Unlock()
 	return l.containerSpecs
 }
+
+// getExitedContainerNames returns the names of the containers
+// which have already exited by the time a checkpoint is created
+func (l *Loader) getExitedContainerNames() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var exited []string
+	for name := range l.containerSpecs {
+		// Skip internal containers
+		if len(name) >= 2 && name[0:2] == "__" {
+			continue
+		}
+
+		cid, ok := l.containerIDs[name]
+		if !ok {
+			continue
+		}
+
+		// Find the process by the CID
+		exec, ok := l.processes[execID{cid: cid}]
+		if !ok {
+			exited = append(exited, name)
+			continue
+		}
+
+		// If there is no task group for the process, it wasn't
+		// restored, so there is no need to check for whether it's
+		// exited
+		if exec.tg == nil {
+			continue
+		}
+
+		if exec.tg.Leader().ExitState() != kernel.TaskExitNone {
+			exited = append(exited, name)
+		}
+	}
+
+	return exited
+}

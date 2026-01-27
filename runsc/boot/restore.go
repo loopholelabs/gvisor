@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"strings"
 	time2 "time"
 
 	specs "github.com/opencontainers/runtime-spec/specs-go"
@@ -58,6 +59,9 @@ const (
 	// ContainerSpecsKey is the key used to add and pop the container specs to the
 	// metadata during save/restore.
 	ContainerSpecsKey = "container_specs"
+	// ExitedContainersKey is a key used to save which containers have already exited by the
+	// time a checkpoint is created
+	ExitedContainersKey = "exited_containers"
 )
 
 // restorer manages a restore session for a sandbox. It stores information about
@@ -107,6 +111,10 @@ type restorer struct {
 	// checkpointedSpecs contains the map of container specs used during
 	// checkpoint.
 	checkpointedSpecs map[string]*specs.Spec
+
+	// exitedContainers contains the map of containers which have already exited by the
+	// time a checkpoint is created
+	exitedContainers map[string]struct{}
 }
 
 // restoreSubcontainer restores a subcontainer.
@@ -448,6 +456,11 @@ func (l *Loader) saveWithOpts(saveOpts *state.SaveOpts, execOpts *control.SaveRe
 		return err
 	}
 	saveOpts.Metadata[ContainerSpecsKey] = specsStr
+
+	// Save already exited containers
+	if exitedContainers := l.getExitedContainerNames(); len(exitedContainers) > 0 {
+		saveOpts.Metadata[ExitedContainersKey] = strings.Join(exitedContainers, ",")
+	}
 
 	if err := l.prepareSaveOptsExtra(saveOpts); err != nil {
 		return err

@@ -20,6 +20,7 @@ import (
 	"io"
 	"path"
 	"strconv"
+	"strings"
 	"sync"
 	gtime "time"
 
@@ -265,6 +266,16 @@ type containerManager struct {
 	// restorer is set when the sandbox in being restored. It stores the state
 	// of all containers and perform all actions required by restore.
 	restorer *restorer
+
+	// checkpointedSpecs keeps track of the container specs stored in the checkpoint
+	checkpointedSpecs map[string]*specs.Spec
+
+	// exitedContainers keeps track of any containers that have exited (e.g. init containers,
+	// but can also be other types of containers)
+	exitedContainers map[string]struct{}
+
+	// completedInitContainers keeps track of any init containers that have completed
+	completedInitContainers map[string]struct{}
 }
 
 // StartRoot will start the root container process.
@@ -375,9 +386,27 @@ func (cm *containerManager) StartSubcontainer(args *StartArgs, _ *struct{}) erro
 	cm.l.mu.Lock()
 	state := cm.l.state
 	cm.l.mu.Unlock()
-	if state != started {
+
+	// We need to be able to start subcontainers while the sandbox is in the restored state so that we
+	// can start init containers before other containers are running (else we get a deadlock because the
+	// init containers are waiting for the sandbox to start with the rest of the containers, which in
+	// turn depend on the init container having started and exited)
+	if state != started && state != restored {
 		return fmt.Errorf("sandbox is not in started state, cannot start subcontainer: state=%s", state)
 	}
+
+	// Create internal boilerplate for containers that will are being restored from the checkpoint
+	containerName := specutils.ContainerName(args.Spec)
+	if state == restored && cm.checkpointedSpecs != nil {
+		if _, wasInCheckpoint := cm.checkpointedSpecs[containerName]; !wasInCheckpoint {
+			if err := cm.l.createSubcontainer(args.CID, nil); err != nil {
+				log.Infof("createSubcontainer for completed init container %q: %v", args.CID, err)
+			}
+
+			return nil
+		}
+	}
+
 	expectedFDs := 1 // At least one FD for the root filesystem.
 	expectedFDs += args.NumGoferFilestoreFDs
 	if args.IsDevIoFilePresent {
@@ -646,6 +675,14 @@ func (cm *containerManager) Restore(o *RestoreOpts, _ *struct{}) (retErr error) 
 	}
 	cm.restorer.checkpointedSpecs = specs
 
+	// Read which containers have exited before the last checkpoint was created from metadata
+	if exitedContainersStr, ok := metadata[ExitedContainersKey]; ok && exitedContainersStr != "" {
+		cm.restorer.exitedContainers = make(map[string]struct{})
+		for _, name := range strings.Split(exitedContainersStr, ",") {
+			cm.restorer.exitedContainers[name] = struct{}{}
+		}
+	}
+
 	checkpointVersion := metadata[VersionKey]
 	currentVersion := version.Version()
 	if checkpointVersion != currentVersion {
@@ -707,6 +744,13 @@ func (cm *containerManager) onRestoreDone() {
 	cm.l.state = restored
 	cm.l.mu.Unlock()
 	cm.l.restoreDone.Broadcast()
+
+	// Capture exitedContainers etc. so that we can access them again after restores
+	if cm.restorer != nil {
+		cm.checkpointedSpecs = cm.restorer.checkpointedSpecs
+		cm.exitedContainers = cm.restorer.exitedContainers
+	}
+
 	cm.restorer = nil
 }
 
@@ -718,9 +762,52 @@ func (cm *containerManager) RestoreSubcontainer(args *StartArgs, _ *struct{}) (r
 	timeline.Reached("cm.l.mu.Lock")
 	state := cm.l.state
 	cm.l.mu.Unlock()
-	if state != restoringUnstarted {
+
+	// See comment on StartSubcontainer() at the same check
+	if state != restoringUnstarted && state != restored {
 		return fmt.Errorf("sandbox is not being restored, cannot restore subcontainer: state=%s", state)
 	}
+
+	var (
+		checkpointedSpecs map[string]*specs.Spec
+		exitedContainers  map[string]struct{}
+	)
+	if state == restoringUnstarted && cm.restorer != nil {
+		checkpointedSpecs = cm.restorer.checkpointedSpecs
+		exitedContainers = cm.restorer.exitedContainers
+	} else if state == restored {
+		checkpointedSpecs = cm.checkpointedSpecs
+		exitedContainers = cm.exitedContainers
+	}
+
+	containerName := specutils.ContainerName(args.Spec)
+	if checkpointedSpecs != nil {
+		if _, wasInCheckpoint := checkpointedSpecs[containerName]; !wasInCheckpoint {
+			if err := cm.l.createSubcontainer(args.CID, nil); err != nil {
+				log.Infof("createSubcontainer for init container %q not in checkpoint: %v", args.CID, err)
+			}
+
+			return nil
+		}
+
+		// If init container has exited before the checkpoint was created, mark it as a completed container
+		if exitedContainers != nil {
+			if _, wasExited := exitedContainers[containerName]; wasExited {
+				if err := cm.l.createSubcontainer(args.CID, nil); err != nil {
+					log.Infof("createSubcontainer for exited init container %q: %v", args.CID, err)
+				}
+
+				if cm.completedInitContainers == nil {
+					cm.completedInitContainers = make(map[string]struct{})
+				}
+
+				cm.completedInitContainers[args.CID] = struct{}{}
+
+				return nil
+			}
+		}
+	}
+
 	defer func() {
 		if retErr != nil {
 			cm.onRestoreFailed(fmt.Errorf("RestoreSubcontainer failed: %w", retErr))
@@ -811,6 +898,16 @@ func (cm *containerManager) Resume(_, _ *struct{}) error {
 // Wait waits for the init process in the given container.
 func (cm *containerManager) Wait(cid *string, waitStatus *uint32) error {
 	log.Debugf("containerManager.Wait, cid: %s", *cid)
+
+	// Don't wait for completed init containers
+	if cm.completedInitContainers != nil {
+		if _, isCompleted := cm.completedInitContainers[*cid]; isCompleted {
+			*waitStatus = 0
+
+			return nil
+		}
+	}
+
 	err := cm.l.waitContainer(*cid, waitStatus)
 	log.Debugf("containerManager.Wait returned, cid: %s, waitStatus: %#x, err: %v", *cid, *waitStatus, err)
 	return err
@@ -904,6 +1001,14 @@ type SignalArgs struct {
 // process group.
 func (cm *containerManager) Signal(args *SignalArgs, _ *struct{}) error {
 	log.Debugf("containerManager.Signal: cid: %s, PID: %d, signal: %d, mode: %v", args.CID, args.PID, args.Signo, args.Mode)
+
+	// Ignore signals on completed init containers
+	if cm.completedInitContainers != nil {
+		if _, isCompleted := cm.completedInitContainers[args.CID]; isCompleted {
+			return nil
+		}
+	}
+
 	return cm.l.signal(args.CID, args.PID, args.Signo, args.Mode)
 }
 
@@ -1058,6 +1163,16 @@ func (cm *containerManager) Mount(args *MountArgs, _ *struct{}) error {
 // ContainerRuntimeState returns the runtime state of a container.
 func (cm *containerManager) ContainerRuntimeState(cid *string, state *ContainerRuntimeState) error {
 	log.Debugf("containerManager.ContainerRuntimeState: cid: %s", *cid)
+
+	// Manually return stopped state for completed init containers
+	if cm.completedInitContainers != nil {
+		if _, isCompleted := cm.completedInitContainers[*cid]; isCompleted {
+			*state = RuntimeStateStopped
+
+			return nil
+		}
+	}
+
 	*state = cm.l.containerRuntimeState(*cid)
 	return nil
 }
