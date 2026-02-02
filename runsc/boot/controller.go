@@ -395,7 +395,7 @@ func (cm *containerManager) StartSubcontainer(args *StartArgs, _ *struct{}) erro
 		return fmt.Errorf("sandbox is not in started state, cannot start subcontainer: state=%s", state)
 	}
 
-	// Create internal boilerplate for containers that will are being restored from the checkpoint
+	// Create internal boilerplate for containers that will be restored from the checkpoint
 	containerName := specutils.ContainerName(args.Spec)
 	if state == restored && cm.checkpointedSpecs != nil {
 		if _, wasInCheckpoint := cm.checkpointedSpecs[containerName]; !wasInCheckpoint {
