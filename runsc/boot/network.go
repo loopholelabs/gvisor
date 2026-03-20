@@ -365,6 +365,7 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 				RXChecksumOffload:    link.RXChecksumOffload,
 				GRO:                  link.GVisorGRO,
 				ProcessorsPerChannel: link.ProcessorsPerChannel,
+				SaveRestore:          true,
 			})
 			if err != nil {
 				return err
